@@ -38,10 +38,12 @@ type ReadResult struct {
 
 // CreateOptions configures how a new note is created.
 type CreateOptions struct {
-	APIKey   string // required: vn_... from your dashboard
-	Title    string // optional
-	MaxViews int    // 1–100, defaults to 1
-	Base     string // optional: override API base URL
+	APIKey    string // required: vn_... from your dashboard
+	Title     string // optional
+	MaxViews  int    // 1–100, defaults to 1
+	ExpiresIn int    // hours: 1, 6, 24, 72, 168, 720 — defaults to 24
+	NoteType  string // "secure" or "pipe" — defaults to "secure"
+	Base      string // optional: override API base URL
 }
 
 // CreateResult holds the shareable link for a newly created note.
@@ -67,10 +69,8 @@ func ReadFrom(urlOrToken, base string) (*ReadResult, error) {
 		return nil, fmt.Errorf("voidnote: invalid token length %d (want 64)", len(token))
 	}
 
-	tokenID := token[:32]
-	secret := token[32:]
-
-	resp, err := http.Get(base + "/api/note/" + tokenID)
+	// Pass the full 64-char token — server splits tokenId/secret and decrypts
+	resp, err := http.Get(base + "/api/note/" + token)
 	if err != nil {
 		return nil, fmt.Errorf("voidnote: fetch failed: %w", err)
 	}
@@ -81,7 +81,7 @@ func ReadFrom(urlOrToken, base string) (*ReadResult, error) {
 		return nil, fmt.Errorf("voidnote: reading response: %w", err)
 	}
 
-	if resp.StatusCode == 404 {
+	if resp.StatusCode == 404 || resp.StatusCode == 410 {
 		return nil, fmt.Errorf("voidnote: note not found or already destroyed")
 	}
 	if resp.StatusCode != 200 {
@@ -89,24 +89,18 @@ func ReadFrom(urlOrToken, base string) (*ReadResult, error) {
 	}
 
 	var payload struct {
-		EncryptedContent string `json:"encrypted_content"`
-		IV               string `json:"iv"`
-		Title            string `json:"title"`
-		ViewCount        int    `json:"view_count"`
-		MaxViews         int    `json:"max_views"`
-		Destroyed        bool   `json:"destroyed"`
+		Content   string `json:"content"`
+		Title     string `json:"title"`
+		ViewCount int    `json:"viewCount"`
+		MaxViews  int    `json:"maxViews"`
+		Destroyed bool   `json:"destroyed"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
 	}
 
-	content, err := decrypt(payload.EncryptedContent, payload.IV, secret)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: decryption failed: %w", err)
-	}
-
 	return &ReadResult{
-		Content:   content,
+		Content:   payload.Content,
 		Title:     payload.Title,
 		ViewCount: payload.ViewCount,
 		MaxViews:  payload.MaxViews,
@@ -121,6 +115,12 @@ func Create(content string, opts CreateOptions) (*CreateResult, error) {
 	}
 	if opts.MaxViews == 0 {
 		opts.MaxViews = 1
+	}
+	if opts.ExpiresIn == 0 {
+		opts.ExpiresIn = 24
+	}
+	if opts.NoteType == "" {
+		opts.NoteType = "secure"
 	}
 	if opts.Base == "" {
 		opts.Base = defaultBase
@@ -146,6 +146,8 @@ func Create(content string, opts CreateOptions) (*CreateResult, error) {
 		"iv":               iv,
 		"maxViews":         opts.MaxViews,
 		"title":            opts.Title,
+		"expiresIn":        opts.ExpiresIn,
+		"noteType":         opts.NoteType,
 	})
 
 	req, err := http.NewRequest("POST", opts.Base+"/api/notes", bytes.NewReader(reqBody))
@@ -528,4 +530,134 @@ func deriveKey(secret string) []byte {
 	secretBytes, _ := hex.DecodeString(secret)
 	hash := sha256.Sum256(secretBytes)
 	return hash[:]
+}
+
+// ---------------------------------------------------------------------------
+// Buy / Credits API
+// ---------------------------------------------------------------------------
+
+// CryptoOrderOptions configures a new crypto payment order.
+type CryptoOrderOptions struct {
+	APIKey   string // required: vn_... from your dashboard
+	BundleID string // "test" | "starter" | "standard" | "pro"
+	Chain    string // "polygon" | "base" | "arbitrum" | "ethereum" | "bitcoin" | "tron"
+	Token    string // "USDT" | "USDC" | "ETH" | "BTC" | "TRX"
+	Base     string // optional: override API base URL
+}
+
+// CryptoOrder is a pending payment order returned by CreateCryptoOrder.
+type CryptoOrder struct {
+	OrderID   string  `json:"orderId"`
+	ToAddress string  `json:"toAddress"`
+	Chain     string  `json:"chain"`
+	Token     string  `json:"token"`
+	Amount    string  `json:"amount"`    // human-readable, e.g. "5.000000"
+	AmountUSD float64 `json:"amountUsd"`
+	Credits   int     `json:"credits"`
+	ExpiresAt string  `json:"expiresAt"`
+}
+
+// SubmitPaymentOptions configures a payment confirmation request.
+type SubmitPaymentOptions struct {
+	APIKey  string // required
+	OrderID string // from CryptoOrder.OrderID
+	TxHash  string // transaction hash from your wallet
+	Base    string // optional: override API base URL
+}
+
+// SubmitPaymentResult is returned after a successful on-chain verification.
+type SubmitPaymentResult struct {
+	Credits      int `json:"credits"`
+	CreditsAdded int `json:"creditsAdded"`
+}
+
+// CreateCryptoOrder creates a crypto payment order for credits.
+// Returns the address and exact amount to send — valid for 1 hour.
+//
+// Example:
+//
+//	order, err := voidnote.CreateCryptoOrder(voidnote.CryptoOrderOptions{
+//	    APIKey: "vn_...", BundleID: "starter", Chain: "polygon", Token: "USDT",
+//	})
+//	fmt.Printf("Send %s %s to %s\n", order.Amount, order.Token, order.ToAddress)
+func CreateCryptoOrder(opts CryptoOrderOptions) (*CryptoOrder, error) {
+	if opts.Base == "" {
+		opts.Base = defaultBase
+	}
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"bundleId": opts.BundleID,
+		"chain":    opts.Chain,
+		"token":    opts.Token,
+	})
+	req, err := http.NewRequest("POST", opts.Base+"/api/buy/crypto/create-order", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("voidnote: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
+
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("voidnote: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		var errResp struct{ Error string `json:"error"` }
+		json.Unmarshal(body, &errResp)
+		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, errResp.Error)
+	}
+
+	var order CryptoOrder
+	if err := json.Unmarshal(body, &order); err != nil {
+		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
+	}
+	return &order, nil
+}
+
+// SubmitCryptoPayment submits a transaction hash to confirm a crypto payment.
+// Verifies on-chain and credits your account instantly.
+//
+// Example:
+//
+//	result, err := voidnote.SubmitCryptoPayment(voidnote.SubmitPaymentOptions{
+//	    APIKey: "vn_...", OrderID: order.OrderID, TxHash: "0x...",
+//	})
+//	fmt.Printf("New balance: %d credits\n", result.Credits)
+func SubmitCryptoPayment(opts SubmitPaymentOptions) (*SubmitPaymentResult, error) {
+	if opts.Base == "" {
+		opts.Base = defaultBase
+	}
+	reqBody, _ := json.Marshal(map[string]interface{}{
+		"orderId": opts.OrderID,
+		"txHash":  opts.TxHash,
+	})
+	req, err := http.NewRequest("POST", opts.Base+"/api/buy/crypto/submit-tx", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("voidnote: building request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("voidnote: request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		var errResp struct{ Error string `json:"error"` }
+		json.Unmarshal(body, &errResp)
+		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, errResp.Error)
+	}
+
+	var result SubmitPaymentResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
+	}
+	return &result, nil
 }
