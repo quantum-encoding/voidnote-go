@@ -4,13 +4,17 @@
 //
 // Usage:
 //
-//	// Create a note (v1 API — client-side encryption, server-generated tokenId)
-//	result, err := voidnote.Create("my secret", voidnote.CreateOptions{APIKey: "vn_..."})
+//	// Create a note — no account needed (v1 API: client-side encryption, server-generated tokenId)
+//	result, err := voidnote.Create("my secret", voidnote.CreateOptions{})
 //	fmt.Println(result.URL)   // https://voidnote.net/n/{tokenId}#{secret}
 //
 //	// Read and decrypt (auto-detects v1 and legacy URL formats)
 //	note, err := voidnote.Read("https://voidnote.net/n/TOKEN#SECRET")
 //	fmt.Println(note.Content)
+//
+//	// Password-protected note
+//	result, err = voidnote.Create("my secret", voidnote.CreateOptions{Password: "correct horse"})
+//	note, err = voidnote.ReadWith(result.URL, voidnote.ReadOptions{Password: "correct horse"})
 package voidnote
 
 import (
@@ -19,19 +23,64 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultBase = "https://voidnote.net"
+
+// Key derivations a note may declare. The AES key comes from the 32-hex secret in the link:
+//
+//	KdfSHA256: key = SHA-256(secret bytes)
+//	KdfPBKDF2: key = PBKDF2-HMAC-SHA256(password UTF-8, salt = secret bytes, 600000 iterations)
+const (
+	KdfSHA256 = "sha256"
+	KdfPBKDF2 = "pbkdf2-sha256-600k"
+
+	PBKDF2Iterations = 600_000
+)
+
+var (
+	// ErrNotFound: the note does not exist, expired, or its views are used up.
+	ErrNotFound = errors.New("voidnote: note not found, expired or already destroyed")
+	// ErrPasswordRequired: the note was created with a password and none was given. No view was used.
+	ErrPasswordRequired = errors.New("voidnote: this note needs a password — set ReadOptions.Password (no view was used)")
+	// ErrUnsupportedKdf: the note uses a key derivation this SDK version cannot do. No view was used.
+	ErrUnsupportedKdf = errors.New("voidnote: unsupported key derivation")
+	// ErrDecryption: the password or the link's key is wrong. The view was used.
+	ErrDecryption = errors.New("voidnote: decryption failed")
+)
+
+// APIError is an HTTP failure reported by the server, with its error message.
+type APIError struct {
+	Op         string
+	StatusCode int
+	Message    string
+	// RetryAfter is how long the server asked the client to wait (429), zero when it did not say.
+	RetryAfter time.Duration
+}
+
+func (e *APIError) Error() string {
+	s := fmt.Sprintf("voidnote: %s: HTTP %d", e.Op, e.StatusCode)
+	if e.Message != "" {
+		s += " — " + e.Message
+	}
+	if e.RetryAfter > 0 {
+		s += fmt.Sprintf(" (retry after %s)", e.RetryAfter)
+	}
+	return s
+}
 
 // ReadResult holds the decrypted content of a note.
 type ReadResult struct {
@@ -39,16 +88,17 @@ type ReadResult struct {
 	Title          string
 	ViewsRemaining int
 	Destroyed      bool
-	// Legacy fields (populated for old-format URLs only)
-	ViewCount int
-	MaxViews  int
+	Kdf            string // v1 notes: KdfSHA256 or KdfPBKDF2
+	ViewCount      int    // views used, including this one
+	MaxViews       int
 }
 
 // CreateOptions configures how a new note is created.
 type CreateOptions struct {
-	APIKey    string // required: vn_... from your dashboard
-	MaxViews  int    // 1–100, defaults to 1
-	ExpiresIn int    // hours: 1, 6, 24, 72, 168, 720 — defaults to 1
+	APIKey    string // optional: vn_... from a free account. Empty creates an anonymous note.
+	Password  string // optional: the reader needs it as well as the link (KdfPBKDF2)
+	MaxViews  int    // defaults to 1; up to 10 anonymous, 100 with an API key
+	ExpiresIn int    // hours, defaults to 1; up to 168 anonymous, 720 with an API key
 	Base      string // optional: override API base URL
 }
 
@@ -57,9 +107,18 @@ type CreateResult struct {
 	URL       string // full shareable URL — includes #secret for v1 notes
 	Token     string // 32-char tokenId
 	ExpiresAt string
+	ViewLimit int
+	Kdf       string
+}
+
+// ReadOptions configures ReadWith.
+type ReadOptions struct {
+	Password string // for notes created with a password; ignored for notes without one
+	Base     string // optional: override API base URL
 }
 
 // PeekResult holds metadata about a note without consuming a view.
+// Kdf is KdfPBKDF2 when the note needs a password.
 type PeekResult struct {
 	Exists         bool
 	Type           string
@@ -67,7 +126,10 @@ type PeekResult struct {
 	ExpiresAt      string
 	ViewLimit      int
 	ViewsRemaining int
+	Kdf            string
 }
+
+var httpClient = &http.Client{Timeout: 15 * time.Second}
 
 // parsedURL holds the result of parsing a note URL.
 type parsedURL struct {
@@ -108,15 +170,98 @@ func isHex32(s string) bool {
 	return true
 }
 
+// retryAfter parses a Retry-After header: delta-seconds or an HTTP date.
+func retryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
+		return time.Duration(secs) * time.Second
+	}
+	if at, err := http.ParseTime(v); err == nil {
+		if d := time.Until(at).Round(time.Second); d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+// apiError reports an HTTP failure with the server's error message when it sent one.
+func apiError(op string, status int, header http.Header, body []byte) error {
+	var payload struct {
+		Error string `json:"error"`
+	}
+	msg := strings.TrimSpace(string(body))
+	if json.Unmarshal(body, &payload) == nil && payload.Error != "" {
+		msg = payload.Error
+	}
+	if len(msg) > 300 {
+		msg = msg[:300]
+	}
+	return &APIError{Op: op, StatusCode: status, Message: msg, RetryAfter: retryAfter(header)}
+}
+
+// doJSON sends req and decodes a 2xx JSON body into out; other statuses become *APIError.
+func doJSON(op string, req *http.Request, out any) error {
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("voidnote: %s failed: %w", op, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("voidnote: %s: reading response: %w", op, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return apiError(op, resp.StatusCode, resp.Header, body)
+	}
+	if err := json.Unmarshal(body, out); err != nil {
+		return fmt.Errorf("voidnote: %s: parsing response: %w", op, err)
+	}
+	return nil
+}
+
+func getJSON(op, url string, out any) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("voidnote: %s: building request: %w", op, err)
+	}
+	return doJSON(op, req, out)
+}
+
+// checkKdf maps an absent kdf to KdfSHA256 and rejects ones this SDK cannot derive.
+func checkKdf(kdf string) (string, error) {
+	switch kdf {
+	case "", KdfSHA256:
+		return KdfSHA256, nil
+	case KdfPBKDF2:
+		return KdfPBKDF2, nil
+	}
+	return "", fmt.Errorf("%w %q — upgrade voidnote-go", ErrUnsupportedKdf, kdf)
+}
+
 // Read fetches and decrypts a VoidNote.
 // urlOrToken may be a v1 URL (https://voidnote.net/n/tokenId#secret),
 // a legacy URL (https://voidnote.net/note/<64-token>), or a raw 64-char token.
 func Read(urlOrToken string) (*ReadResult, error) {
-	return ReadFrom(urlOrToken, "")
+	return ReadWith(urlOrToken, ReadOptions{})
 }
 
 // ReadFrom is like Read but allows overriding the base URL.
 func ReadFrom(urlOrToken, base string) (*ReadResult, error) {
+	return ReadWith(urlOrToken, ReadOptions{Base: base})
+}
+
+// ReadWith is like Read with a password for notes created with one.
+//
+// v1 notes are checked first without using a view: a missing note returns
+// ErrNotFound, a note that needs a password when none was given returns
+// ErrPasswordRequired, and an unknown key derivation returns ErrUnsupportedKdf,
+// all with the view unused. A wrong password (ErrDecryption) is only detectable
+// after the view is used.
+func ReadWith(urlOrToken string, opts ReadOptions) (*ReadResult, error) {
+	base := opts.Base
 	if base == "" {
 		base = defaultBase
 	}
@@ -127,28 +272,30 @@ func ReadFrom(urlOrToken, base string) (*ReadResult, error) {
 	}
 
 	if parsed.isV1 {
-		return readV1(parsed.tokenID, parsed.secret, base)
+		return readV1(parsed.tokenID, parsed.secret, base, opts.Password)
 	}
 	return readLegacy(parsed.fullToken, base)
 }
 
-// readV1 calls the v1 consume endpoint and decrypts client-side.
-func readV1(tokenID, secret, base string) (*ReadResult, error) {
-	resp, err := http.Get(base + "/api/v1/note/" + tokenID + "/consume/")
+// readV1 checks the note's metadata, calls the v1 consume endpoint and decrypts client-side.
+func readV1(tokenID, secret, base, password string) (*ReadResult, error) {
+	var meta struct {
+		Exists    bool   `json:"exists"`
+		ViewLimit int    `json:"viewLimit"`
+		Kdf       string `json:"kdf"`
+	}
+	if err := getJSON("read", base+"/api/v1/note/"+tokenID+"/meta/", &meta); err != nil {
+		return nil, err
+	}
+	if !meta.Exists {
+		return nil, ErrNotFound
+	}
+	metaKdf, err := checkKdf(meta.Kdf)
 	if err != nil {
-		return nil, fmt.Errorf("voidnote: fetch failed: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: reading response: %w", err)
-	}
-	if resp.StatusCode == 410 || resp.StatusCode == 404 {
-		return nil, fmt.Errorf("voidnote: note not found or already destroyed")
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, string(body))
+	if metaKdf != KdfSHA256 && password == "" {
+		return nil, ErrPasswordRequired
 	}
 
 	var payload struct {
@@ -156,42 +303,46 @@ func readV1(tokenID, secret, base string) (*ReadResult, error) {
 		IV             string `json:"iv"`
 		ViewsRemaining int    `json:"viewsRemaining"`
 		Destroyed      bool   `json:"destroyed"`
+		Kdf            string `json:"kdf"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
+	if err := getJSON("read", base+"/api/v1/note/"+tokenID+"/consume/", &payload); err != nil {
+		return nil, err
+	}
+	kdf := metaKdf
+	if payload.Kdf != "" {
+		if kdf, err = checkKdf(payload.Kdf); err != nil {
+			return nil, err
+		}
 	}
 
-	content, err := decrypt(payload.Encrypted, payload.IV, secret)
+	key, err := noteKey(secret, kdf, password)
 	if err != nil {
-		return nil, fmt.Errorf("voidnote: decryption failed: %w", err)
+		return nil, err
+	}
+	content, err := decryptWithKey(payload.Encrypted, payload.IV, key)
+	if err != nil {
+		if kdf == KdfSHA256 {
+			return nil, fmt.Errorf("%w: the link's key is wrong or incomplete", ErrDecryption)
+		}
+		return nil, fmt.Errorf("%w: wrong password (this read used a view)", ErrDecryption)
 	}
 
+	maxViews := meta.ViewLimit
+	if maxViews == 0 {
+		maxViews = payload.ViewsRemaining + 1
+	}
 	return &ReadResult{
 		Content:        content,
 		ViewsRemaining: payload.ViewsRemaining,
 		Destroyed:      payload.Destroyed,
+		Kdf:            kdf,
+		ViewCount:      maxViews - payload.ViewsRemaining,
+		MaxViews:       maxViews,
 	}, nil
 }
 
 // readLegacy calls the old server-decrypt endpoint (backward compat).
 func readLegacy(fullToken, base string) (*ReadResult, error) {
-	resp, err := http.Get(base + "/api/note/" + fullToken + "/")
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: fetch failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: reading response: %w", err)
-	}
-	if resp.StatusCode == 404 || resp.StatusCode == 410 {
-		return nil, fmt.Errorf("voidnote: note not found or already destroyed")
-	}
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, string(body))
-	}
-
 	var payload struct {
 		Content   string `json:"content"`
 		Title     string `json:"title"`
@@ -199,8 +350,8 @@ func readLegacy(fullToken, base string) (*ReadResult, error) {
 		MaxViews  int    `json:"maxViews"`
 		Destroyed bool   `json:"destroyed"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
+	if err := getJSON("read", base+"/api/note/"+fullToken+"/", &payload); err != nil {
+		return nil, err
 	}
 	return &ReadResult{
 		Content:   payload.Content,
@@ -229,13 +380,6 @@ func Peek(urlOrToken string, base ...string) (*PeekResult, error) {
 		return nil, fmt.Errorf("voidnote: cannot extract tokenId from input")
 	}
 
-	resp, err := http.Get(apiBase + "/api/v1/note/" + strings.ToLower(tokenID) + "/meta/")
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: fetch failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
 	var result struct {
 		Exists         bool   `json:"exists"`
 		Type           string `json:"type"`
@@ -243,8 +387,11 @@ func Peek(urlOrToken string, base ...string) (*PeekResult, error) {
 		ExpiresAt      string `json:"expiresAt"`
 		ViewLimit      int    `json:"viewLimit"`
 		ViewsRemaining int    `json:"viewsRemaining"`
+		Kdf            string `json:"kdf"`
 	}
-	json.Unmarshal(body, &result)
+	if err := getJSON("peek", apiBase+"/api/v1/note/"+strings.ToLower(tokenID)+"/meta/", &result); err != nil {
+		return nil, err
+	}
 	return &PeekResult{
 		Exists:         result.Exists,
 		Type:           result.Type,
@@ -252,24 +399,34 @@ func Peek(urlOrToken string, base ...string) (*PeekResult, error) {
 		ExpiresAt:      result.ExpiresAt,
 		ViewLimit:      result.ViewLimit,
 		ViewsRemaining: result.ViewsRemaining,
+		Kdf:            result.Kdf,
 	}, nil
 }
 
 // Create encrypts content client-side and stores a new note on VoidNote using the v1 API.
 // The server generates the tokenId. The client holds the secret in the URL fragment.
 // The returned URL is https://voidnote.net/n/{tokenId}#{secret} — share the full URL.
+//
+// No API key is needed: without one the note is anonymous, held to 168 hours and
+// 10 views, and rate-limited per IP. With a Password the key is derived with
+// PBKDF2 and the reader needs both the link and the password. Server refusals
+// (limits, rate limiting) return *APIError with the server's message and RetryAfter.
 func Create(content string, opts CreateOptions) (*CreateResult, error) {
-	if opts.APIKey == "" {
-		return nil, fmt.Errorf("voidnote: APIKey is required")
-	}
 	if opts.MaxViews == 0 {
 		opts.MaxViews = 1
 	}
 	if opts.ExpiresIn == 0 {
 		opts.ExpiresIn = 1 // default 1 hour
 	}
+	if opts.MaxViews < 0 || opts.ExpiresIn < 0 {
+		return nil, fmt.Errorf("voidnote: MaxViews and ExpiresIn must be positive")
+	}
 	if opts.Base == "" {
 		opts.Base = defaultBase
+	}
+	kdf := KdfSHA256
+	if opts.Password != "" {
+		kdf = KdfPBKDF2
 	}
 
 	// Generate secret only — server generates tokenId
@@ -279,7 +436,11 @@ func Create(content string, opts CreateOptions) (*CreateResult, error) {
 	}
 	secret := hex.EncodeToString(secretBytes)
 
-	encryptedContent, iv, err := encrypt(content, secret)
+	key, err := noteKey(secret, kdf, opts.Password)
+	if err != nil {
+		return nil, err
+	}
+	encryptedContent, iv, err := encryptWithKey(content, key)
 	if err != nil {
 		return nil, fmt.Errorf("voidnote: encryption failed: %w", err)
 	}
@@ -289,6 +450,7 @@ func Create(content string, opts CreateOptions) (*CreateResult, error) {
 		"iv":        iv,
 		"expiresIn": opts.ExpiresIn * 3600, // hours → seconds
 		"viewLimit": opts.MaxViews,
+		"kdf":       kdf,
 	})
 
 	req, err := http.NewRequest("POST", opts.Base+"/api/v1/note/", bytes.NewReader(reqBody))
@@ -296,35 +458,34 @@ func Create(content string, opts CreateOptions) (*CreateResult, error) {
 		return nil, fmt.Errorf("voidnote: building request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: reading response: %w", err)
-	}
-	if resp.StatusCode != 200 && resp.StatusCode != 201 {
-		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, string(body))
+	if opts.APIKey != "" {
+		req.Header.Set("Authorization", "Bearer "+opts.APIKey)
 	}
 
 	var result struct {
 		Token     string `json:"token"`
 		URL       string `json:"url"`
 		ExpiresAt string `json:"expiresAt"`
+		ViewLimit int    `json:"viewLimit"`
+		Kdf       string `json:"kdf"`
 	}
-	json.Unmarshal(body, &result)
+	if err := doJSON("create", req, &result); err != nil {
+		return nil, err
+	}
+	if result.ViewLimit == 0 {
+		result.ViewLimit = opts.MaxViews
+	}
+	if result.Kdf == "" {
+		result.Kdf = kdf
+	}
 
 	// Append #secret to make the full shareable URL
 	return &CreateResult{
 		URL:       result.URL + "#" + secret,
 		Token:     result.Token,
 		ExpiresAt: result.ExpiresAt,
+		ViewLimit: result.ViewLimit,
+		Kdf:       result.Kdf,
 	}, nil
 }
 
@@ -364,25 +525,7 @@ type WatchOptions struct {
 	Base     string
 }
 
-// apiError reports an HTTP failure with the server's error message when it sent one.
-func apiError(op string, status int, body []byte) error {
-	var payload struct {
-		Error string `json:"error"`
-	}
-	msg := strings.TrimSpace(string(body))
-	if json.Unmarshal(body, &payload) == nil && payload.Error != "" {
-		msg = payload.Error
-	}
-	if len(msg) > 300 {
-		msg = msg[:300]
-	}
-	if msg == "" {
-		return fmt.Errorf("voidnote: %s: HTTP %d", op, status)
-	}
-	return fmt.Errorf("voidnote: %s: HTTP %d — %s", op, status, msg)
-}
-
-// CreateStream creates a new Void Stream. Costs 1 credit.
+// CreateStream creates a new Void Stream. Requires an API key from a free account.
 func CreateStream(opts StreamOptions) (*StreamHandle, error) {
 	if opts.APIKey == "" {
 		return nil, fmt.Errorf("voidnote: APIKey is required")
@@ -419,7 +562,7 @@ func CreateStream(opts StreamOptions) (*StreamHandle, error) {
 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return nil, apiError("create stream", resp.StatusCode, body)
+		return nil, apiError("create stream", resp.StatusCode, resp.Header, body)
 	}
 
 	var result struct {
@@ -458,7 +601,7 @@ func (s *StreamHandle) post(op, endpoint string, body []byte) error {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
-		return apiError(op, resp.StatusCode, respBody)
+		return apiError(op, resp.StatusCode, resp.Header, respBody)
 	}
 	return nil
 }
@@ -532,7 +675,7 @@ func joinStream(ctx context.Context, apiBase, token, password string) (string, e
 		return "", errStreamEnded
 	}
 	if resp.StatusCode != 200 {
-		return "", apiError("join", resp.StatusCode, body)
+		return "", apiError("join", resp.StatusCode, resp.Header, body)
 	}
 	var result struct {
 		AccessToken string `json:"accessToken"`
@@ -646,7 +789,7 @@ func WatchWith(ctx context.Context, urlOrToken string, opts WatchOptions) (<-cha
 			if resp.StatusCode != 200 {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
-				fail(apiError("watch", resp.StatusCode, body))
+				fail(apiError("watch", resp.StatusCode, resp.Header, body))
 				return
 			}
 			rejoined = false
@@ -698,118 +841,6 @@ func WatchWith(ctx context.Context, urlOrToken string, opts WatchOptions) (<-cha
 }
 
 // ---------------------------------------------------------------------------
-// Buy / Credits API
-// ---------------------------------------------------------------------------
-
-type CryptoOrderOptions struct {
-	APIKey   string
-	BundleID string // "test" | "starter" | "standard" | "pro"
-	Chain    string // "polygon" | "base" | "arbitrum" | "ethereum" | "bitcoin" | "tron"
-	Token    string // "USDT" | "USDC" | "ETH" | "BTC" | "TRX"
-	Base     string
-}
-
-type CryptoOrder struct {
-	OrderID   string  `json:"orderId"`
-	ToAddress string  `json:"toAddress"`
-	Chain     string  `json:"chain"`
-	Token     string  `json:"token"`
-	Amount    string  `json:"amount"`
-	AmountUSD float64 `json:"amountUsd"`
-	Credits   int     `json:"credits"`
-	ExpiresAt string  `json:"expiresAt"`
-}
-
-type SubmitPaymentOptions struct {
-	APIKey  string
-	OrderID string
-	TxHash  string
-	Base    string
-}
-
-type SubmitPaymentResult struct {
-	Credits      int `json:"credits"`
-	CreditsAdded int `json:"creditsAdded"`
-}
-
-func CreateCryptoOrder(opts CryptoOrderOptions) (*CryptoOrder, error) {
-	if opts.Base == "" {
-		opts.Base = defaultBase
-	}
-	reqBody, _ := json.Marshal(map[string]any{
-		"bundleId": opts.BundleID,
-		"chain":    opts.Chain,
-		"token":    opts.Token,
-	})
-	req, err := http.NewRequest("POST", opts.Base+"/api/buy/crypto/create-order/", bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: building request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		json.Unmarshal(body, &errResp)
-		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, errResp.Error)
-	}
-
-	var order CryptoOrder
-	if err := json.Unmarshal(body, &order); err != nil {
-		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
-	}
-	return &order, nil
-}
-
-func SubmitCryptoPayment(opts SubmitPaymentOptions) (*SubmitPaymentResult, error) {
-	if opts.Base == "" {
-		opts.Base = defaultBase
-	}
-	reqBody, _ := json.Marshal(map[string]any{
-		"orderId": opts.OrderID,
-		"txHash":  opts.TxHash,
-	})
-	req, err := http.NewRequest("POST", opts.Base+"/api/buy/crypto/submit-tx/", bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: building request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+opts.APIKey)
-
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("voidnote: request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != 200 {
-		var errResp struct {
-			Error string `json:"error"`
-		}
-		json.Unmarshal(body, &errResp)
-		return nil, fmt.Errorf("voidnote: server returned %d: %s", resp.StatusCode, errResp.Error)
-	}
-
-	var result SubmitPaymentResult
-	if err := json.Unmarshal(body, &result); err != nil {
-		return nil, fmt.Errorf("voidnote: parsing response: %w", err)
-	}
-	return &result, nil
-}
-
-// ---------------------------------------------------------------------------
 // Internal crypto
 // ---------------------------------------------------------------------------
 
@@ -847,7 +878,10 @@ func extractLegacyToken(urlOrToken string) string {
 }
 
 func encrypt(plaintext, secret string) (encryptedHex, ivHex string, err error) {
-	key := deriveKey(secret)
+	return encryptWithKey(plaintext, deriveKey(secret))
+}
+
+func encryptWithKey(plaintext string, key []byte) (encryptedHex, ivHex string, err error) {
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", "", err
@@ -864,12 +898,25 @@ func encrypt(plaintext, secret string) (encryptedHex, ivHex string, err error) {
 	return hex.EncodeToString(ciphertext), hex.EncodeToString(iv), nil
 }
 
-func decrypt(encryptedHex, ivHex, secret string) (string, error) {
-	return decryptWithKey(encryptedHex, ivHex, deriveKey(secret))
-}
-
+// deriveKey is the sha256 derivation used by streams and KdfSHA256 notes.
 func deriveKey(secret string) []byte {
 	secretBytes, _ := hex.DecodeString(secret)
 	hash := sha256.Sum256(secretBytes)
 	return hash[:]
+}
+
+// noteKey derives a note's AES-256 key from its secret with the named kdf.
+func noteKey(secret, kdf, password string) ([]byte, error) {
+	if kdf != KdfPBKDF2 {
+		return deriveKey(secret), nil
+	}
+	if password == "" {
+		return nil, ErrPasswordRequired
+	}
+	salt, err := hex.DecodeString(secret)
+	if err != nil {
+		return nil, fmt.Errorf("voidnote: invalid secret: %w", err)
+	}
+	// Go strings are byte sequences, so the password goes in as the caller's (UTF-8) bytes.
+	return pbkdf2.Key(sha256.New, password, salt, PBKDF2Iterations, 32)
 }
